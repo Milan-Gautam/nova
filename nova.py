@@ -283,24 +283,38 @@ class NovaValidator:
 
     @staticmethod
     def is_valid_js_content(content: str, content_type: str = '') -> bool:
-        if not content or len(content) < 10:
+        """
+        Reject soft-404 HTML pages served with a 200 status on a .js URL.
+        Do NOT try to positively confirm "this looks like JS" via keyword
+        matching -- minified/bundled output from esbuild, Vite, Rollup,
+        Terser, etc. frequently writes `import{x}from"y"`, `const{a}=b`,
+        single-character re-export shims, or pure-comment/license-header
+        files with no keyword ever appearing in the checked window. Those
+        are all valid JS. Requiring a keyword match (previous behavior)
+        silently dropped real JS files with zero indication why.
+        """
+        if not content or len(content) < 1:
             return False
 
         if content_type:
             ct = content_type.lower().split(';')[0].strip()
-            if 'html' in ct or 'xml' in ct or 'css' in ct:
+            if ct in ('text/html', 'application/xhtml+xml', 'text/xml',
+                      'application/xml', 'text/css'):
                 return False
 
-        first_bytes = content[:200].lower().strip()
-        if any(tag in first_bytes for tag in ['<!doctype', '<html', '<body', '<?xml']):
+        # Look further in than 200 chars -- large license-header comment
+        # blocks (common when bundling multiple libraries) can easily
+        # exceed 200 chars before any doctype/html tag would appear anyway.
+        head = content[:1000].lower().lstrip()
+        if head.startswith(('<!doctype', '<html', '<?xml')):
+            return False
+        # A body tag appearing in the very first bytes is a strong signal
+        # of an HTML error/soft-404 page rather than JS with a stray
+        # string literal containing "<body" somewhere later in the file.
+        if '<body' in content[:300].lower():
             return False
 
-        js_indicators = [
-            'function', 'var ', 'let ', 'const ', '=>', '===',
-            'require', 'import ', 'export ', 'module.exports',
-        ]
-
-        return any(indicator in first_bytes for indicator in js_indicators)
+        return True
 
 
 class NovaBanner:
@@ -520,14 +534,16 @@ class NOVA:
                 except Exception:
                     return None
 
-            async def fetch(url: str, method: str = 'GET') -> Optional[Tuple[aiohttp.ClientResponse, Optional[str]]]:
+            async def fetch(url: str, method: str = 'GET', _retry_as_crawler: bool = True) -> Optional[Tuple[aiohttp.ClientResponse, Optional[str]]]:
                 async with semaphore:
                     await rate_limiter.acquire()
                     stats['requests_made'] += 1
 
-                    async def do_request():
+                    async def do_request(extra_headers: Optional[Dict[str, str]] = None):
+                        req_headers = extra_headers or {}
                         async with session.request(
                             method, url,
+                            headers=req_headers,
                             allow_redirects=self.config.follow_redirects,
                             max_redirects=self.config.max_redirects,
                         ) as response:
@@ -558,14 +574,36 @@ class NOVA:
                                     return response, content
                                 except Exception:
                                     return None
+                            elif response.status == 403 and _retry_as_crawler:
+                                # Signal caller to retry once with a crawler UA. Many WAFs
+                                # block generic client UAs but allow known search-engine bots.
+                                return '__RETRY_403__'
                             else:
                                 stats['requests_failed'] += 1
                                 return None
 
                     try:
-                        return await retry_handler.execute(do_request)
-                    except Exception:
+                        result = await retry_handler.execute(do_request)
+                        if result == '__RETRY_403__':
+                            crawler_ua = (
+                                'Mozilla/5.0 (compatible; Googlebot/2.1; '
+                                '+http://www.google.com/bot.html)'
+                            )
+                            result = await retry_handler.execute(
+                                do_request, {'User-Agent': crawler_ua}
+                            )
+                            if result == '__RETRY_403__':
+                                stats['requests_failed'] += 1
+                                logger.debug(f"[FETCH-FAIL] {url} -> HTTP 403 (crawler UA also blocked)")
+                                return None
+                        return result
+                    except RetryableStatusError as e:
                         stats['requests_failed'] += 1
+                        logger.debug(f"[FETCH-FAIL] {url} -> HTTP {e.status} (exhausted retries)")
+                        return None
+                    except Exception as e:
+                        stats['requests_failed'] += 1
+                        logger.debug(f"[FETCH-FAIL] {url} -> {type(e).__name__}: {e}")
                         return None
 
             def extract_endpoints_from_content(content: str, base_url: str) -> Set[str]:
@@ -906,7 +944,7 @@ class NOVA:
             }
 
             with open(os.path.join(target_dir, 'report.json'), 'w') as f:
-                json.dump(target_report, f, indent=2)
+                json.dump(target_report, f, indent=2, default=str)
 
         if self.config.merge_results:
             all_js = set()
@@ -956,7 +994,10 @@ class NOVA:
         }
 
         with open(os.path.join(output_base, 'summary.json'), 'w') as f:
-            json.dump(summary, f, indent=2)
+            # default=str converts start_time/end_time datetimes (and anything
+            # else non-JSON-native) to strings instead of crashing the whole
+            # run at the very last step after all the scanning work is done.
+            json.dump(summary, f, indent=2, default=str)
 
         logger.info(f"\n{Fore.GREEN}{'='*70}{Style.RESET_ALL}")
         logger.info(f"{Fore.GREEN}[SAVED] Results: {output_base}{Style.RESET_ALL}")
@@ -1153,7 +1194,10 @@ def main():
         proxy=args.proxy,
         cookies=cookies,
         headers=headers,
-        user_agent=args.user_agent or 'Mozilla/5.0',
+        # Bare "Mozilla/5.0" with nothing else is a well-known bot-detection
+        # signature -- fall through to NovaConfig's realistic full UA string
+        # instead of overriding it with a truncated one.
+        **({'user_agent': args.user_agent} if args.user_agent else {}),
         passive_scan=not args.no_passive,
         brute_force=not args.no_brute,
         deep_analysis=not args.no_deep,
