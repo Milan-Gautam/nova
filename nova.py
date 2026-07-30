@@ -439,9 +439,38 @@ class NOVA:
 
         os.makedirs(config.output_dir, exist_ok=True)
 
-    async def process_target(self, target_url: str) -> TargetResult:
+    async def process_target(self, target_url: str, target_dir: str) -> TargetResult:
         target_domain = urlparse(target_url).netloc
         target_scheme = urlparse(target_url).scheme
+
+        # Create the target's output directory and open live-write files NOW,
+        # before any scanning happens. Previously all output was buffered in
+        # memory and only written once, at the very end of the ENTIRE batch,
+        # in _save_results(). That meant a long scan, a scan on a later
+        # target that errors out, or the process being interrupted mid-run
+        # lost everything found so far -- even though it was printing
+        # "[+] Found JS: ..." to the console the whole time. Now every
+        # discovered JS file / endpoint / secret is appended to disk
+        # immediately, as it's found.
+        os.makedirs(target_dir, exist_ok=True)
+        live_js_path = os.path.join(target_dir, 'js_files.txt')
+        live_endpoints_path = os.path.join(target_dir, 'endpoints.txt')
+        live_secrets_path = os.path.join(target_dir, 'secrets.txt')
+        # Truncate any stale files from a previous run of the same target in
+        # this output dir before appending fresh results.
+        open(live_js_path, 'w').close()
+        open(live_endpoints_path, 'w').close()
+        open(live_secrets_path, 'w').close()
+
+        def live_append(path: str, line: str):
+            # Synchronous append is safe here: this is asyncio single-threaded
+            # code with no `await` between open/write/close, so there's no
+            # interleaving between coroutines on this file.
+            try:
+                with open(path, 'a') as f:
+                    f.write(line + '\n')
+            except Exception as e:
+                logger.debug(f"[SAVE-FAIL] Could not write to {path}: {e}")
 
         result = TargetResult(
             target_url=target_url,
@@ -664,6 +693,7 @@ class NOVA:
 
                 js_files[js_url] = js_file
                 stats['js_files_found'] += 1
+                live_append(live_js_path, js_url)
 
                 if not self.config.quiet:
                     logger.info(f"  {Fore.GREEN}[JS]{Style.RESET_ALL} {js_url}")
@@ -677,8 +707,14 @@ class NOVA:
                     js_file.endpoints = new_endpoints
                     js_file.secrets = new_secrets
 
+                    newly_seen_endpoints = new_endpoints - endpoints
+                    newly_seen_secrets = new_secrets - secrets
                     endpoints.update(new_endpoints)
                     secrets.update(new_secrets)
+                    for ep in newly_seen_endpoints:
+                        live_append(live_endpoints_path, ep)
+                    for sec in newly_seen_secrets:
+                        live_append(live_secrets_path, sec)
 
                     stats['endpoints_discovered'] = len(endpoints)
                     stats['secrets_found'] = len(secrets)
@@ -869,27 +905,60 @@ class NOVA:
 
         NovaBanner.display(self.config)
 
+        # Compute the output location ONCE, up front, so every target writes
+        # to the same scan folder as it completes -- not only at the very
+        # end of the whole batch.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_base = os.path.join(self.config.output_dir, f'nova_scan_{timestamp}')
+        os.makedirs(self.output_base, exist_ok=True)
+
         sem = asyncio.Semaphore(self.config.concurrent_targets)
 
         async def process_with_limit(target_url: str):
             async with sem:
                 logger.info(f"{Fore.MAGENTA}[TARGET]{Style.RESET_ALL} Starting: {target_url}")
 
-                result = await self.process_target(target_url)
+                domain = urlparse(target_url).netloc
+                safe_domain = domain.replace(':', '_').replace('.', '_') or f"target_{len(self.all_results)}"
+                target_dir = os.path.join(self.output_base, safe_domain)
+
+                try:
+                    result = await self.process_target(target_url, target_dir)
+                except Exception as e:
+                    # A bug or unexpected failure on ONE target must not take
+                    # down the whole batch or lose results already saved for
+                    # other targets. Live-written js_files.txt/endpoints.txt
+                    # for THIS target still exist on disk even if we land
+                    # here mid-scan.
+                    logger.error(f"  {Fore.RED}[CRASH]{Style.RESET_ALL} {target_url}: {e}")
+                    result = TargetResult(
+                        target_url=target_url,
+                        domain=domain,
+                        start_time=datetime.now(),
+                        end_time=datetime.now(),
+                        success=False,
+                        error=str(e),
+                    )
+
                 self.all_results[target_url] = result
+
+                # Save this target's final consolidated report NOW, right as
+                # it finishes -- do not wait for every other target in the
+                # batch to also finish first.
+                self._save_target_result(result, target_dir)
 
                 if result.success:
                     self.global_stats['successful_targets'] += 1
-                    self.global_stats['total_js_files'] += result.stats['js_files_found']
-                    self.global_stats['total_endpoints'] += result.stats['endpoints_discovered']
-                    self.global_stats['total_secrets'] += result.stats['secrets_found']
+                    self.global_stats['total_js_files'] += result.stats.get('js_files_found', 0)
+                    self.global_stats['total_endpoints'] += result.stats.get('endpoints_discovered', 0)
+                    self.global_stats['total_secrets'] += result.stats.get('secrets_found', 0)
 
                     duration = (result.end_time - result.start_time).total_seconds()
                     logger.info(
                         f"{Fore.GREEN}[DONE]{Style.RESET_ALL} {target_url} | "
-                        f"JS: {result.stats['js_files_found']} | "
-                        f"Endpoints: {result.stats['endpoints_discovered']} | "
-                        f"Secrets: {result.stats['secrets_found']} | "
+                        f"JS: {result.stats.get('js_files_found', 0)} | "
+                        f"Endpoints: {result.stats.get('endpoints_discovered', 0)} | "
+                        f"Secrets: {result.stats.get('secrets_found', 0)} | "
                         f"Duration: {duration:.1f}s"
                     )
                 else:
@@ -898,27 +967,33 @@ class NOVA:
 
                 return result
 
-        tasks = [process_with_limit(url) for url in self.config.target_urls]
-        await asyncio.gather(*tasks)
+        try:
+            tasks = [process_with_limit(url) for url in self.config.target_urls]
+            await asyncio.gather(*tasks)
+        finally:
+            # Runs even on KeyboardInterrupt/CancelledError -- whatever
+            # targets finished (and were already saved above as they
+            # completed) still get a summary written rather than losing
+            # everything because the run didn't reach a clean finish.
+            self.global_stats['end_time'] = datetime.now()
+            self._save_global_summary()
+            self._print_final_summary()
 
-        self.global_stats['end_time'] = datetime.now()
-
-        self._save_results()
-        self._print_final_summary()
-
-    def _save_results(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_base = os.path.join(self.config.output_dir, f'nova_scan_{timestamp}')
-        os.makedirs(output_base, exist_ok=True)
-
-        for target_url, result in self.all_results.items():
-            domain = urlparse(target_url).netloc.replace(':', '_').replace('.', '_')
-            target_dir = os.path.join(output_base, domain)
+    def _save_target_result(self, result: TargetResult, target_dir: str):
+        """
+        Write the final, deduplicated, sorted version of one target's
+        results. This runs as soon as THAT target finishes (see run()),
+        not after the whole batch completes. The live-appended files written
+        during the scan (see process_target/live_append) already guarantee
+        nothing is lost even if the process is killed before this point --
+        this just replaces them with a clean final copy plus the JSON report.
+        """
+        try:
             os.makedirs(target_dir, exist_ok=True)
 
             if result.js_files:
                 with open(os.path.join(target_dir, 'js_files.txt'), 'w') as f:
-                    for url in result.js_files.keys():
+                    for url in sorted(result.js_files.keys()):
                         f.write(f"{url}\n")
 
             if result.endpoints:
@@ -932,11 +1007,11 @@ class NOVA:
                         f.write(f"{secret}\n")
 
             target_report = {
-                'target': target_url,
+                'target': result.target_url,
                 'domain': result.domain,
                 'success': result.success,
                 'error': result.error,
-                'duration': (result.end_time - result.start_time).total_seconds() if result.end_time else 0,
+                'duration': (result.end_time - result.start_time).total_seconds() if result.end_time and result.start_time else 0,
                 'statistics': result.stats,
                 'js_files_count': len(result.js_files),
                 'endpoints_count': len(result.endpoints),
@@ -945,6 +1020,25 @@ class NOVA:
 
             with open(os.path.join(target_dir, 'report.json'), 'w') as f:
                 json.dump(target_report, f, indent=2, default=str)
+
+            if not self.config.quiet:
+                logger.info(f"  {Fore.GREEN}[SAVED]{Style.RESET_ALL} {target_dir}")
+
+        except Exception as e:
+            # Saving must never silently no-op -- if this fails, say so,
+            # since it means the scan's findings are at risk of being lost.
+            logger.error(f"  {Fore.RED}[SAVE-ERROR]{Style.RESET_ALL} Could not write results for {result.target_url}: {e}")
+
+    def _save_global_summary(self):
+        output_base = getattr(self, 'output_base', None)
+        if not output_base:
+            # Defensive fallback -- should not happen since run() sets this
+            # before any target starts, but never silently drop the summary.
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_base = os.path.join(self.config.output_dir, f'nova_scan_{timestamp}')
+            os.makedirs(output_base, exist_ok=True)
+        else:
+            timestamp = os.path.basename(output_base).replace('nova_scan_', '')
 
         if self.config.merge_results:
             all_js = set()
