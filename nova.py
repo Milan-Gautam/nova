@@ -666,6 +666,38 @@ class NOVA:
 
                 return found
 
+            def extract_js_urls_from_content(content: str, base_url: str) -> Set[str]:
+                """
+                Find EVERY reference to a .js file in the given content, no
+                matter how it's written -- full URL, protocol-relative,
+                absolute path ("/car/main.js"), relative path
+                ("car/main.js", "./chunk.js", "../lib/x.js"), or a bare
+                filename -- and resolve every single one to a full,
+                absolute URL. Deliberately overlaps with import/require
+                pattern matching and <script src> parsing elsewhere; sets
+                de-duplicate, and the goal is not missing a JS reference
+                just because a given site happens to write it as a plain
+                object value or route-map string instead of a proper
+                import/require statement.
+                """
+                found = set()
+                # Any quoted string ending in .js (optionally followed by a
+                # query string or fragment), 1-300 chars, no embedded
+                # whitespace/quotes. Covers all reference styles above --
+                # resolve_url() figures out absolute vs relative vs full URL.
+                pattern = re.compile(
+                    r'["\']([^"\'\s]{1,300}?\.js)(?:[?#][^"\']*)?["\']',
+                    re.IGNORECASE
+                )
+                for match in pattern.findall(content):
+                    match = match.strip()
+                    if not match or match.startswith(('data:', 'javascript:', 'blob:', 'mailto:')):
+                        continue
+                    resolved = resolve_url(match, base_url)
+                    if resolved and self.validator.is_valid_js_url(resolved):
+                        found.add(resolved.split('?')[0])
+                return found
+
             async def process_js(js_url: str, source: str):
                 if js_url in js_files:
                     return
@@ -701,7 +733,8 @@ class NOVA:
                 if self.config.deep_analysis and content:
                     stats['js_analyzed'] += 1
                     new_js, new_endpoints, new_secrets = self._extract_from_js(
-                        content, js_url, target_domain, target_scheme, extract_endpoints_from_content
+                        content, js_url, target_domain, target_scheme,
+                        extract_endpoints_from_content, extract_js_urls_from_content
                     )
 
                     js_file.endpoints = new_endpoints
@@ -750,11 +783,17 @@ class NOVA:
 
                 soup = BeautifulSoup(html, 'html.parser')
 
-                script_targets = []
+                script_targets = set()
                 for script in soup.find_all('script', src=True):
                     resolved = resolve_url(script['src'], url)
                     if resolved and self.validator.is_valid_js_url(resolved):
-                        script_targets.append(resolved)
+                        script_targets.add(resolved)
+
+                # Also scan the raw HTML for any .js reference the strict
+                # <script src> parse would miss -- inline scripts building
+                # a URL from a string, JSON config blobs embedded in the
+                # page, data-* attributes, etc.
+                script_targets.update(extract_js_urls_from_content(html, url))
 
                 # JS files on a page are independent -- fetch/analyze them concurrently
                 await asyncio.gather(*[process_js(u, f"page:{url}") for u in script_targets])
@@ -842,7 +881,21 @@ class NOVA:
                 if self.config.brute_force:
                     await brute_force()
 
-                await crawl(target_url, 0)
+                if self.validator.is_valid_js_url(target_url):
+                    # Target is a direct JS file URL (e.g. -u
+                    # https://site.com/app.js), not a webpage. Crawling it
+                    # as HTML would silently find nothing -- BeautifulSoup
+                    # parsing raw JS finds zero <script src> tags and zero
+                    # <a href> links, so the scan would just end with no
+                    # results and no error. Process it directly as a JS
+                    # file instead, which fetches it, adds it to
+                    # js_files.txt, and follows any JS-to-JS chain it
+                    # references.
+                    if not self.config.quiet:
+                        logger.info(f"  {Fore.CYAN}[MODE]{Style.RESET_ALL} Target is a direct JS file -- processing as JS, not crawling as HTML")
+                    await process_js(target_url, "direct-target")
+                else:
+                    await crawl(target_url, 0)
 
                 result.success = True
 
@@ -866,38 +919,31 @@ class NOVA:
         target_domain: str,
         target_scheme: str,
         extract_endpoints_from_content,
+        extract_js_urls_from_content,
     ) -> Tuple[Set[str], Set[str], Set[str]]:
         """Extract JS files, endpoints, and secrets from JavaScript content"""
         new_js = set()
         endpoints = set()
         secrets = set()
 
-        import_patterns = [
-            re.compile(r'import\s+.*?\s+from\s+["\']([^"\']+\.js)["\']', re.IGNORECASE),
-            re.compile(r'import\s*\(\s*["\']([^"\']+\.js)["\']\s*\)', re.IGNORECASE),
-            re.compile(r'require\s*\(\s*["\']([^"\']+\.js)["\']\s*\)', re.IGNORECASE),
-        ]
+        # Comprehensive JS-reference discovery -- catches every form a .js
+        # file can be referenced in: proper import/require statements,
+        # absolute paths ("/car/main.js"), relative paths ("car/main.js",
+        # "./chunk.js", "../lib/x.js"), protocol-relative and full URLs,
+        # and bare filenames used as plain object/string values (route
+        # maps, lazy-load tables, etc). Every match is resolved to a full,
+        # absolute URL regardless of how it was originally written.
+        new_js.update(extract_js_urls_from_content(js_content, js_url))
 
-        for pattern in import_patterns:
-            for match in pattern.findall(js_content):
-                resolved = urljoin(js_url, match)
-                if self.validator.is_valid_js_url(resolved):
-                    new_js.add(resolved.split('?')[0])
-
-        # Always run path/endpoint extraction (regardless of --no-endpoints)
-        # to catch bare-path JS references like "/car/main.js" that aren't
-        # written as an import/require statement -- e.g. a router config,
-        # a lazy-load map, or a plain string reference. Anything that
-        # resolves to a .js URL is a JS file, not a generic endpoint, so it
-        # goes into new_js (and gets fetched/crawled/added to js_files.txt
-        # with its full resolved URL) rather than only landing in
-        # endpoints.txt.
-        all_resolved_paths = extract_endpoints_from_content(js_content, js_url)
-        for item in all_resolved_paths:
-            if self.validator.is_valid_js_url(item):
-                new_js.add(item.split('?')[0])
-            elif self.config.extract_endpoints:
-                endpoints.add(item)
+        # Non-.js endpoints (API paths, config files, etc). Any .js-looking
+        # path this also happens to catch gets folded into new_js instead
+        # of endpoints -- it's a JS file, not a generic endpoint.
+        if self.config.extract_endpoints:
+            for item in extract_endpoints_from_content(js_content, js_url):
+                if self.validator.is_valid_js_url(item):
+                    new_js.add(item.split('?')[0])
+                else:
+                    endpoints.add(item)
 
         if self.config.extract_secrets:
             secret_pattern = re.compile(
