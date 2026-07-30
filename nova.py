@@ -884,10 +884,20 @@ class NOVA:
                 if self.validator.is_valid_js_url(resolved):
                     new_js.add(resolved.split('?')[0])
 
-        if self.config.extract_endpoints:
-            # Broadened extraction: full-domain URLs AND bare absolute paths
-            # (e.g. "/constructor/main.js") both get resolved to a full domain URL.
-            endpoints.update(extract_endpoints_from_content(js_content, js_url))
+        # Always run path/endpoint extraction (regardless of --no-endpoints)
+        # to catch bare-path JS references like "/car/main.js" that aren't
+        # written as an import/require statement -- e.g. a router config,
+        # a lazy-load map, or a plain string reference. Anything that
+        # resolves to a .js URL is a JS file, not a generic endpoint, so it
+        # goes into new_js (and gets fetched/crawled/added to js_files.txt
+        # with its full resolved URL) rather than only landing in
+        # endpoints.txt.
+        all_resolved_paths = extract_endpoints_from_content(js_content, js_url)
+        for item in all_resolved_paths:
+            if self.validator.is_valid_js_url(item):
+                new_js.add(item.split('?')[0])
+            elif self.config.extract_endpoints:
+                endpoints.add(item)
 
         if self.config.extract_secrets:
             secret_pattern = re.compile(
