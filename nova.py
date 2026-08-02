@@ -113,6 +113,7 @@ class JSFile:
 class TargetResult:
     target_url: str
     domain: str
+    all_targets: List[str] = field(default_factory=list)
     js_files: Dict[str, JSFile] = field(default_factory=OrderedDict)
     endpoints: Set[str] = field(default_factory=set)
     secrets: Set[str] = field(default_factory=set)
@@ -428,6 +429,7 @@ class NOVA:
         self.all_results: Dict[str, TargetResult] = OrderedDict()
         self.global_stats = {
             'total_targets': 0,
+            'total_inputs': 0,
             'successful_targets': 0,
             'failed_targets': 0,
             'total_js_files': 0,
@@ -439,9 +441,16 @@ class NOVA:
 
         os.makedirs(config.output_dir, exist_ok=True)
 
-    async def process_target(self, target_url: str, target_dir: str) -> TargetResult:
-        target_domain = urlparse(target_url).netloc
-        target_scheme = urlparse(target_url).scheme
+    async def process_target(self, target_urls: List[str], target_domain: str, target_dir: str) -> TargetResult:
+        # target_urls are ALL the raw inputs that share this one domain
+        # (could be one URL, or a mix of page URLs and/or direct JS file
+        # URLs -- e.g. a list of JS files all on the same host). Every one
+        # of them feeds into ONE shared js_files/endpoints/secrets state
+        # and ONE output directory, instead of each getting its own
+        # directory keyed only by domain -- which previously meant two
+        # targets on the same host would race to truncate/overwrite each
+        # other's output files.
+        target_scheme = urlparse(target_urls[0]).scheme or 'https'
 
         # Create the target's output directory and open live-write files NOW,
         # before any scanning happens. Previously all output was buffered in
@@ -473,8 +482,9 @@ class NOVA:
                 logger.debug(f"[SAVE-FAIL] Could not write to {path}: {e}")
 
         result = TargetResult(
-            target_url=target_url,
+            target_url=target_urls[0],
             domain=target_domain,
+            all_targets=list(target_urls),
             start_time=datetime.now(),
         )
 
@@ -482,6 +492,16 @@ class NOVA:
         endpoints: Set[str] = set()
         secrets: Set[str] = set()
         crawled_urls: Set[str] = set()
+        # Reserved synchronously (before any await) the moment a JS URL is
+        # queued, so two concurrent chains that both reference the same
+        # file (e.g. a shared vendor.js) don't both slip past the
+        # `js_url in js_files` check and fetch it twice -- js_files only
+        # gets its entry AFTER the fetch completes, which left a window
+        # for duplicate work under concurrency. Deliberately never removed
+        # on failure either -- once a URL has been attempted (success or
+        # not) there's no benefit to a second source re-triggering the
+        # same failed fetch.
+        in_flight: Set[str] = set()
 
         # Per-target instances -- fixes shared-rate-limiter/retry-handler bleed across targets
         rate_limiter = NovaRateLimiter(self.config.rate_limit)
@@ -575,6 +595,7 @@ class NOVA:
                             headers=req_headers,
                             allow_redirects=self.config.follow_redirects,
                             max_redirects=self.config.max_redirects,
+                            proxy=self.config.proxy,
                         ) as response:
                             if response.status in retry_handler.retryable_statuses:
                                 # Raise so NovaRetryHandler actually retries/backs off,
@@ -699,7 +720,7 @@ class NOVA:
                 return found
 
             async def process_js(js_url: str, source: str):
-                if js_url in js_files:
+                if js_url in js_files or js_url in in_flight:
                     return
 
                 if len(js_files) >= self.config.max_js_files:
@@ -707,6 +728,12 @@ class NOVA:
 
                 if not self.validator.is_valid_js_url(js_url):
                     return
+
+                # Reserve BEFORE awaiting -- js_files only gets its entry
+                # once the fetch below completes, so without this a second
+                # concurrent chain referencing the same URL could pass the
+                # check above and start its own duplicate fetch.
+                in_flight.add(js_url)
 
                 result = await fetch(js_url)
                 if not result:
@@ -830,10 +857,17 @@ class NOVA:
                 ]
 
                 sem = asyncio.Semaphore(10)
+                # Always build from the domain root explicitly, not
+                # urljoin(target_url, path) -- if target_url is itself a
+                # JS file (e.g. https://site.com/static/bundle.js),
+                # urljoin resolves relative to that file's directory
+                # ("static/js/main.js") instead of the intended domain
+                # root ("js/main.js").
+                root = f"{target_scheme}://{target_domain}"
 
                 async def check_path(path: str):
                     async with sem:
-                        url = urljoin(target_url, path)
+                        url = f"{root}/{path}"
                         if url not in js_files:
                             result = await fetch(url, method='HEAD')
                             if result:
@@ -881,26 +915,33 @@ class NOVA:
                 if self.config.brute_force:
                     await brute_force()
 
-                if self.validator.is_valid_js_url(target_url):
-                    # Target is a direct JS file URL (e.g. -u
-                    # https://site.com/app.js), not a webpage. Crawling it
-                    # as HTML would silently find nothing -- BeautifulSoup
-                    # parsing raw JS finds zero <script src> tags and zero
-                    # <a href> links, so the scan would just end with no
-                    # results and no error. Process it directly as a JS
-                    # file instead, which fetches it, adds it to
-                    # js_files.txt, and follows any JS-to-JS chain it
-                    # references.
-                    if not self.config.quiet:
-                        logger.info(f"  {Fore.CYAN}[MODE]{Style.RESET_ALL} Target is a direct JS file -- processing as JS, not crawling as HTML")
-                    await process_js(target_url, "direct-target")
-                else:
-                    await crawl(target_url, 0)
+                # Dispatch every raw target that was grouped under this
+                # domain. Each one is either a direct JS file URL (e.g.
+                # -u https://site.com/app.js -- crawling it as HTML would
+                # silently find nothing, since BeautifulSoup parsing raw
+                # JS finds zero <script src> tags and zero <a href>
+                # links) or a webpage to crawl normally. All of them feed
+                # into the SAME shared js_files/endpoints/secrets state
+                # for this domain, run concurrently.
+                js_file_targets = [u for u in target_urls if self.validator.is_valid_js_url(u)]
+                page_targets = [u for u in target_urls if u not in js_file_targets]
+
+                if js_file_targets and not self.config.quiet:
+                    logger.info(
+                        f"  {Fore.CYAN}[MODE]{Style.RESET_ALL} "
+                        f"{len(js_file_targets)} direct JS file target(s) for {target_domain} "
+                        f"-- processing as JS, not crawling as HTML"
+                    )
+
+                await asyncio.gather(
+                    *[process_js(u, "direct-target") for u in js_file_targets],
+                    *[crawl(u, 0) for u in page_targets],
+                )
 
                 result.success = True
 
             except Exception as e:
-                logger.error(f"  {Fore.RED}[ERROR]{Style.RESET_ALL} {target_url}: {e}")
+                logger.error(f"  {Fore.RED}[ERROR]{Style.RESET_ALL} {target_domain}: {e}")
                 result.error = str(e)
                 result.success = False
 
@@ -957,9 +998,26 @@ class NOVA:
 
     async def run(self):
         self.global_stats['start_time'] = datetime.now()
-        self.global_stats['total_targets'] = len(self.config.target_urls)
 
         NovaBanner.display(self.config)
+
+        # Group raw targets by domain -- a "target" from the user's
+        # perspective can be a URL, bare domain, or JS file, and a batch
+        # can legitimately contain several of these for the SAME host
+        # (e.g. a list of JS file URLs discovered elsewhere, all on one
+        # site). Without this grouping, each one got its own directory
+        # keyed only by domain name, so concurrent same-domain targets
+        # raced to truncate/overwrite each other's live output files.
+        # Grouping means one host = one output directory = one merged,
+        # correct result, regardless of how many individual targets (or
+        # what mix of pages vs JS files) point at it.
+        domain_groups: "OrderedDict[str, List[str]]" = OrderedDict()
+        for t in self.config.target_urls:
+            d = urlparse(t).netloc
+            domain_groups.setdefault(d, []).append(t)
+
+        self.global_stats['total_targets'] = len(domain_groups)
+        self.global_stats['total_inputs'] = len(self.config.target_urls)
 
         # Compute the output location ONCE, up front, so every target writes
         # to the same scan folder as it completes -- not only at the very
@@ -970,36 +1028,42 @@ class NOVA:
 
         sem = asyncio.Semaphore(self.config.concurrent_targets)
 
-        async def process_with_limit(target_url: str):
+        async def process_with_limit(domain: str, urls_for_domain: List[str]):
             async with sem:
-                logger.info(f"{Fore.MAGENTA}[TARGET]{Style.RESET_ALL} Starting: {target_url}")
+                if len(urls_for_domain) > 1:
+                    logger.info(
+                        f"{Fore.MAGENTA}[TARGET]{Style.RESET_ALL} Starting: {domain} "
+                        f"({len(urls_for_domain)} inputs merged)"
+                    )
+                else:
+                    logger.info(f"{Fore.MAGENTA}[TARGET]{Style.RESET_ALL} Starting: {urls_for_domain[0]}")
 
-                domain = urlparse(target_url).netloc
-                safe_domain = domain.replace(':', '_').replace('.', '_') or f"target_{len(self.all_results)}"
+                safe_domain = domain.replace(':', '_').replace('.', '_') or f"target_{abs(hash(tuple(urls_for_domain)))}"
                 target_dir = os.path.join(self.output_base, safe_domain)
 
                 try:
-                    result = await self.process_target(target_url, target_dir)
+                    result = await self.process_target(urls_for_domain, domain, target_dir)
                 except Exception as e:
-                    # A bug or unexpected failure on ONE target must not take
+                    # A bug or unexpected failure on ONE domain must not take
                     # down the whole batch or lose results already saved for
-                    # other targets. Live-written js_files.txt/endpoints.txt
-                    # for THIS target still exist on disk even if we land
+                    # other domains. Live-written js_files.txt/endpoints.txt
+                    # for THIS domain still exist on disk even if we land
                     # here mid-scan.
-                    logger.error(f"  {Fore.RED}[CRASH]{Style.RESET_ALL} {target_url}: {e}")
+                    logger.error(f"  {Fore.RED}[CRASH]{Style.RESET_ALL} {domain}: {e}")
                     result = TargetResult(
-                        target_url=target_url,
+                        target_url=urls_for_domain[0],
                         domain=domain,
+                        all_targets=urls_for_domain,
                         start_time=datetime.now(),
                         end_time=datetime.now(),
                         success=False,
                         error=str(e),
                     )
 
-                self.all_results[target_url] = result
+                self.all_results[domain] = result
 
-                # Save this target's final consolidated report NOW, right as
-                # it finishes -- do not wait for every other target in the
+                # Save this domain's final consolidated report NOW, right as
+                # it finishes -- do not wait for every other domain in the
                 # batch to also finish first.
                 self._save_target_result(result, target_dir)
 
@@ -1011,7 +1075,7 @@ class NOVA:
 
                     duration = (result.end_time - result.start_time).total_seconds()
                     logger.info(
-                        f"{Fore.GREEN}[DONE]{Style.RESET_ALL} {target_url} | "
+                        f"{Fore.GREEN}[DONE]{Style.RESET_ALL} {domain} | "
                         f"JS: {result.stats.get('js_files_found', 0)} | "
                         f"Endpoints: {result.stats.get('endpoints_discovered', 0)} | "
                         f"Secrets: {result.stats.get('secrets_found', 0)} | "
@@ -1019,12 +1083,12 @@ class NOVA:
                     )
                 else:
                     self.global_stats['failed_targets'] += 1
-                    logger.error(f"{Fore.RED}[FAIL]{Style.RESET_ALL} {target_url}: {result.error}")
+                    logger.error(f"{Fore.RED}[FAIL]{Style.RESET_ALL} {domain}: {result.error}")
 
                 return result
 
         try:
-            tasks = [process_with_limit(url) for url in self.config.target_urls]
+            tasks = [process_with_limit(d, urls) for d, urls in domain_groups.items()]
             await asyncio.gather(*tasks)
         finally:
             # Runs even on KeyboardInterrupt/CancelledError -- whatever
@@ -1064,6 +1128,7 @@ class NOVA:
 
             target_report = {
                 'target': result.target_url,
+                'all_targets': result.all_targets,
                 'domain': result.domain,
                 'success': result.success,
                 'error': result.error,
@@ -1131,15 +1196,15 @@ class NOVA:
             },
             'global_stats': self.global_stats,
             'targets': {
-                url: {
-                    'domain': result.domain,
+                domain: {
+                    'all_targets': result.all_targets,
                     'success': result.success,
                     'js_files': len(result.js_files),
                     'endpoints': len(result.endpoints),
                     'secrets': len(result.secrets),
                     'stats': result.stats,
                 }
-                for url, result in self.all_results.items()
+                for domain, result in self.all_results.items()
             }
         }
 
@@ -1175,10 +1240,9 @@ class NOVA:
         print(f"  {'Target':<40} {'JS':<6} {'Endpoints':<10} {'Secrets':<8} {'Status'}")
         print(f"  {'-'*40} {'-'*6} {'-'*10} {'-'*8} {'-'*10}")
 
-        for target_url, result in self.all_results.items():
-            domain = urlparse(target_url).netloc[:38]
+        for domain, result in self.all_results.items():
             status = f"{Fore.GREEN}SUCCESS{Style.RESET_ALL}" if result.success else f"{Fore.RED}FAILED{Style.RESET_ALL}"
-            print(f"  {domain:<40} {len(result.js_files):<6} {len(result.endpoints):<10} {len(result.secrets):<8} {status}")
+            print(f"  {domain[:38]:<40} {len(result.js_files):<6} {len(result.endpoints):<10} {len(result.secrets):<8} {status}")
 
         if self.config.quiet:
             for result in self.all_results.values():
